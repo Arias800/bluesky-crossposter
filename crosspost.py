@@ -2,145 +2,150 @@ from atproto import Client
 import tweepy
 from mastodon import Mastodon
 from datetime import datetime, timedelta
-from auth import *
-from paths import *
+import auth as auth
+import paths as paths
 import settings
-import json, os, urllib.request, random, string, shutil, re
+import json
+import os
+import urllib.request
+import random
+import string
+import shutil
+import re
 
 date_in_format = '%Y-%m-%dT%H:%M:%S'
 
-# Setting up connections to bluesky, twitter and mastodon
-
+# Setting up connections to bluesky, twitter, and mastodon
 bsky = Client()
-bsky.login(bsky_handle, bsky_password)
+bsky.login(auth.bsky_handle, auth.bsky_password)
 # After changes in twitters API we need to use tweepy.Client to make posts as it uses version 2.0 of the API.
 # However, uploading images is still not included in 2.0, so for that we need to use tweepy.API, which uses
 # the previous version.
 if settings.Twitter:
-    twitter = tweepy.Client(consumer_key=TWITTER_APP_KEY,
-                        consumer_secret=TWITTER_APP_SECRET,
-                        access_token=TWITTER_ACCESS_TOKEN,
-                        access_token_secret=TWITTER_ACCESS_TOKEN_SECRET)
+    twitter = tweepy.Client(consumer_key=auth.TWITTER_APP_KEY,
+                            consumer_secret=auth.TWITTER_APP_SECRET,
+                            access_token=auth.TWITTER_ACCESS_TOKEN,
+                            access_token_secret=auth.TWITTER_ACCESS_TOKEN_SECRET)
 
-    tweepy_auth = tweepy.OAuth1UserHandler(TWITTER_APP_KEY, TWITTER_APP_SECRET, TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_TOKEN_SECRET)
+    tweepy_auth = tweepy.OAuth1UserHandler(auth.TWITTER_APP_KEY, auth.TWITTER_APP_SECRET, auth.TWITTER_ACCESS_TOKEN, auth.TWITTER_ACCESS_TOKEN_SECRET)
     twitter_images = tweepy.API(tweepy_auth)
 
 if settings.Mastodon:
     mastodon = Mastodon(
-        access_token = MASTODON_TOKEN,
-        api_base_url = MASTODON_INSTANCE
+        access_token=auth.MASTODON_TOKEN,
+        api_base_url=auth.MASTODON_INSTANCE
     )
 
 # Getting posts from bluesky
-
-def getPosts():
-    writeLog("Gathering posts")
+def get_posts():
+    write_log("Gathering posts")
     posts = {}
     # Getting feed of user
-    profile_feed = bsky.app.bsky.feed.get_author_feed({'actor': bsky_handle})
+    profile_feed = bsky.app.bsky.feed.get_author_feed({'actor': auth.bsky_handle})
     for feed_view in profile_feed.feed:
-        if feed_view.post.author.handle != bsky_handle:
+        if feed_view.post.author.handle != auth.bsky_handle:
             continue
         # Post type "post" means it is not a quote post.
-        postType = "post"
-        # If post has an embed of type record it is a quote post, and should not be crossposted
+        post_type = "post"
+        # If post has an embed of type record it is a quote post and should not be cross-posted
         cid = feed_view.post.cid
         text = feed_view.post.record.text
         # Sometimes bluesky shortens URLs and in that case we need to restore them before crossposting
         if feed_view.post.record.facets:
-            text = restoreUrls(feed_view.post.record)
+            text = restore_urls(feed_view.post.record)
         langs = feed_view.post.record.langs
-        timestamp = datetime.strptime(feed_view.post.indexed_at.split(".")[0], date_in_format) + timedelta(hours = 2)
+        timestamp = datetime.strptime(feed_view.post.indexed_at.split(".")[0], date_in_format) + timedelta(hours=2)
         # Setting replyToUser to the same as user handle and only changing it if the tweet is an actual reply.
         # This way we can just check if the variable is the same as the user handle later and send through
         # both tweets that are not replies, and posts that are part of a thread.
-        replyToUser = bsky_handle
-        replyTo = ""
+        reply_to_user = auth.bsky_handle
+        reply_to = ""
         # Checking if post is a quote post. Posts with references to feeds look like quote posts but aren't, and so will fail on missing attribute.
         # Since quote posts can give values in two different ways it's a bit of a hassle to double check if it is an actual quote post,
         # so instead I just try to run the function and if it fails I skip the post
         # If there is some reason you would want to crosspost a post referencing a bluesky-feed that I'm not seeing, I might update this in the future.
         if feed_view.post.embed and hasattr(feed_view.post.embed, "record"):
             try:
-                replyToUser, replyTo = getQuotePost(feed_view.post.embed.record)
-                postType = "quote"
-            except:
-                writeLog("Post is of a type the crossposter can't parse.")
+                reply_to_user, reply_to = get_quote_post(feed_view.post.embed.record)
+                post_type = "quote"
+            except Exception:
+                write_log("Post is of a type the crossposter can't parse.")
                 continue
         # Checking if post is regular reply
         elif feed_view.post.record.reply:
-            postType = "reply"
-            replyTo = feed_view.post.record.reply.parent.cid
+            post_type = "reply"
+            reply_to = feed_view.post.record.reply.parent.cid
             # Poster will try to fetch reply to-username the "ordinary" way, 
             # and if it fails, it will try getting the entire thread and
             # finding it that way
             try:
-                replyToUser = feed_view.reply.parent.author.handle
-            except:
-                replyToUser = getReplyToUser(feed_view.post.record.reply.parent)
+                reply_to_user = feed_view.reply.parent.author.handle
+            except Exception:
+                reply_to_user = get_reply_to_user(feed_view.post.record.reply.parent)
         # If unable to fetch user that was replied to, code will skip this post.
-        if not replyToUser:
-            writeLog("Unable to find the user that this post replies to or quotes")
+        if not reply_to_user:
+            write_log("Unable to find the user that this post replies to or quotes")
             continue
         # Checking if post is by user (i.e. not a repost), withing timelimit and either not a reply or a reply in a thread.
-        if timestamp > datetime.now() - timedelta(hours = settings.postTimeLimit) and replyToUser == bsky_handle:
+        if timestamp > datetime.now() - timedelta(hours=settings.postTimeLimit) and reply_to_user == auth.bsky_handle:
             # Fetching images if there are any in the post
-            imageData = ""
+            image_data = ""
             images = []
             if feed_view.post.embed and hasattr(feed_view.post.embed, "images"):
-                imageData = feed_view.post.embed.images
-            elif feed_view.post.embed and hasattr(feed_view.post.embed, "media") and postType == "quote":
-                imageData = feed_view.post.embed.media.images
-            if imageData:
-                for image in imageData:
+                image_data = feed_view.post.embed.images
+            elif feed_view.post.embed and hasattr(feed_view.post.embed, "media") and post_type == "quote":
+                image_data = feed_view.post.embed.media.images
+            if image_data:
+                for image in image_data:
                     images.append({"url": image.fullsize, "alt": image.alt})
-            postInfo = {
+            post_info = {
                 "text": text,
-                "replyTo": replyTo,
+                "replyTo": reply_to,
                 "images": images,
-                "type": postType,
+                "type": post_type,
                 "langs": langs
             }
             # Saving post to posts dictionary
-            posts[cid] = postInfo;
+            posts[cid] = post_info
     return posts
 
+# Function for getting username of person replied to
 # Function for getting username of person replied to. It can mostly be retrieved from the reply section of the tweet that has been fetched,
 # but in cases where the original post in a thread has been deleted it causes some weirdness. Hopefully this resolves it.
-def getReplyToUser(reply):
+def get_reply_to_user(reply):
     uri = reply.uri
     username = ""
-    try: 
+    try:
         response = bsky.app.bsky.feed.get_post_thread(params={"uri": uri})
         username = response.thread.post.author.handle
-    except:
-        writeLog("Unable to retrieve replyTo-user.")
+    except Exception:
+        write_log("Unable to retrieve replyTo-user.")
     return username
 
 # Function for getting included images. If no images are included, an empty list will be returned, 
 # and the posting functions will know not to include any images.
-def getImages(images):
-    localImages = []
+def get_images(images):
+    local_images = []
     for image in images:
         # Getting alt text for image. If there is none this will be an empty string.
         alt = image["alt"]
         # Giving the image just a random filename
         filename = ''.join(random.choice(string.ascii_lowercase) for i in range(10)) + ".jpg"
-        filename = imagePath + filename
+        filename = os.path.join(paths.imagePath, filename)
         # Downloading fullsize version of image
         urllib.request.urlretrieve(image["url"], filename)
         # Saving image info in a dictionary and adding it to the list.
-        imageInfo = {
+        image_info = {
             "filename": filename,
             "alt": alt
         }
-        localImages.append(imageInfo)
-    return localImages
+        local_images.append(image_info)
+    return local_images
 
 # Function for restoring shortened URLS
-def restoreUrls(record):
+def restore_urls(record):
     text = record.text
-    encodedText = text.encode("UTF-8")
+    encoded_text = text.encode("UTF-8")
     for facet in record.facets:
         if facet.features[0].py_type != "app.bsky.richtext.facet#link":
             continue
@@ -149,12 +154,12 @@ def restoreUrls(record):
         # string representing the URL in the post, and replace it with the actual URL.
         start = facet.index.byte_start
         end = facet.index.byte_end
-        section = encodedText[start:end]
+        section = encoded_text[start:end]
         shortened = section.decode("UTF-8")
         text = text.replace(shortened, url)
     return text
 
-def getQuotePost(post):
+def get_quote_post(post):
     if isinstance(post, dict):
         user = post["record"]["author"]["handle"]
         cid = post["record"]["cid"]
@@ -166,14 +171,6 @@ def getQuotePost(post):
         cid = post.record.cid
     return user, cid
 
-# Deprecated function
-def imageFail(post):
-    if (post.embed and (hasattr(post.record.embed, "image") or hasattr(post.record.embed, "media"))
-        and not hasattr(post.embed, "images")):
-        return True
-    else:
-        return False
-
 def post(posts):
     # The updates status is set to false until anything has been altered in the databse. If nothing has been posted in a run, we skip resaving the database.
     updates = False
@@ -181,95 +178,93 @@ def post(posts):
     for cid in reversed(list(posts.keys())):
         # Checking if the post is already in the database, and in that case getting the IDs for the post
         # on twitter and mastodon. If one or both of these IDs are empty, post will be sent.
-        tweetId = ""
-        tootId = ""
-        tFail = 0
-        mFail = 0
+        tweet_id = ""
+        toot_id = ""
+        t_fail = 0
+        m_fail = 0
         if cid in database:
-            tweetId = database[cid]["ids"]["twitterId"]
-            tootId = database[cid]["ids"]["mastodonId"]
-            tFail = database[cid]["failed"]["twitter"]
-            mFail = database[cid]["failed"]["mastodon"]
-        if mFail >= settings.maxRetries:
-            writeLog("Error limit reached, not posting to Mastodon")
-            if not tootId:
+            tweet_id = database[cid]["ids"]["twitterId"]
+            toot_id = database[cid]["ids"]["mastodonId"]
+            t_fail = database[cid]["failed"]["twitter"]
+            m_fail = database[cid]["failed"]["mastodon"]
+        if m_fail >= settings.maxRetries:
+            write_log("Error limit reached, not posting to Mastodon")
+            if not toot_id:
                 updates = True
-                tootId = "FailedToPost"
-        if tFail >= settings.maxRetries:
-            writeLog("Error limit reached, not posting to Twitter")
-            if not tweetId:
+                toot_id = "FailedToPost"
+        if t_fail >= settings.maxRetries:
+            write_log("Error limit reached, not posting to Twitter")
+            if not tweet_id:
                 updates = True
-                tweetId = "FailedToPost"
+                tweet_id = "FailedToPost"
         text = posts[cid]["text"]
-        replyTo = posts[cid]["replyTo"]
+        reply_to = posts[cid]["replyTo"]
         images = posts[cid]["images"]
-        postType = posts[cid]["type"]
+        post_type = posts[cid]["type"]
         langs = posts[cid]["langs"]
-        tweetReply = ""
-        tootReply = ""
+        tweet_reply = ""
+        toot_reply = ""
         # If it is a reply, we get the IDs of the posts we want to reply to from the database.
         # If post is not found in database, we can't continue the thread on mastodon and twitter,
         # and so we skip it.
-        if replyTo in database:
-            tweetReply = database[replyTo]["ids"]["twitterId"]
-            tootReply = database[replyTo]["ids"]["mastodonId"]
-        elif replyTo and replyTo not in database:
-            writeLog("Post was a reply to a post that is not in the database.")
+        if reply_to in database:
+            tweet_reply = database[reply_to]["ids"]["twitterId"]
+            toot_reply = database[reply_to]["ids"]["mastodonId"]
+        elif reply_to and reply_to not in database:
+            write_log("Post was a reply to a post that is not in the database.")
             continue
         # If either tweet or toot has not previously been posted, we download images (given the post includes images).
-        if images and (not tweetId or not tootId):
-            images = getImages(images)
         # Trying to post to twitter and mastodon. If posting fails the post ID for each service is set to an
         # empty string, letting the code know it should try again next time the code is run.
-        if not tweetId and tweetReply != "skipped" and tweetReply != "FailedToPost":
+        if not tweet_id and tweet_reply != "skipped" and tweet_reply != "FailedToPost":
             updates = True
             try:
-                tweetId = tweet(text, tweetReply, images, postType, langToggle(langs, "twitter"))
+                tweet_id = tweet(text, tweet_reply, images, post_type, lang_toggle(langs, "twitter"))
             except Exception as error:
-                writeLog(error)
-                tFail += 1
-                tweetId = ""
+                write_log(error)
+                t_fail += 1
+                tweet_id = ""
         else:
-            writeLog("Not posting to Twitter")
+            write_log("Not posting to Twitter")
         # Mastodon does not have a quote retweet function, so those will just be sent as replies.
-        if not tootId and tootReply != "skipped" and tootReply != "FailedToPost":
+        if not toot_id and toot_reply != "skipped" and toot_reply != "FailedToPost":
             updates = True
             try:
-                tootId = toot(text, tootReply, images, langToggle(langs, "mastodon"))
+                toot_id = toot(text, toot_reply, images, lang_toggle(langs, "mastodon"))
             except Exception as error:
-                writeLog(error)
-                mFail += 1
-                tootId = ""
+                write_log(error)
+                m_fail += 1
+                toot_id = ""
         else:
-            writeLog("Not posting to Mastodon")
+            write_log("Not posting to Mastodon")
         # Saving post to database
-        jsonWrite(cid, tweetId, tootId, {"twitter": tFail, "mastodon": mFail})
+        json_write(cid, tweet_id, toot_id, {"twitter": t_fail, "mastodon": m_fail})
     return updates
 
 # This function uses the language selection as a way to select which posts should be crossposted.
-def langToggle(langs, service):
+def lang_toggle(langs, service):
     if service == "twitter":
-        langToggle = settings.twitterLang
+        lang_toggle = settings.twitterLang
     elif service == "mastodon":
-        langToggle = settings.mastodonLang
+        lang_toggle = settings.mastodonLang
     else:
-        writeLog("Something has gone very wrong")
+        write_log("Something has gone very wrong")
         exit()
-    if not langToggle:
+    if not lang_toggle:
         return True
-    if langs and langToggle in langs:
+    if langs and lang_toggle in langs:
         return (not settings.postDefault)
     else:
         return settings.postDefault
 
 # Function for posting tweets
-def tweet(post, replyTo, images, postType, doPost):
-    if not settings.Twitter or not doPost:
-        return "skipped";
-    mediaIds = []
+def tweet(post, reply_to, images, post_type, do_post):
+    if not settings.Twitter or not do_post:
+        return "skipped"
+    media_ids = []
     # If post includes images, images are uploaded so that they can be included in the tweet
     if images:
-        mediaIds = []
+        media_ids = []
         for image in images:
             filename = image["filename"]
             alt = image["alt"]
@@ -279,14 +274,14 @@ def tweet(post, replyTo, images, postType, doPost):
             id = res.media_id
             # If alt text was added to the image on bluesky, it's also added to the image on twitter.
             if alt:
-                writeLog("Uploading image " + filename + " with alt: " + alt + " to twitter")
+                write_log("Uploading image " + filename + " with alt: " + alt + " to twitter")
                 twitter_images.create_media_metadata(id, alt)
-            mediaIds.append(id)
+            media_ids.append(id)
     # Checking if the post is longer than 280 characters, and if so sending to the
     # splitPost-function.
-    partTwo = ""
-    if postLength(post) > 280:
-        post, partTwo = splitPost(post)
+    part_two = ""
+    if post_length(post) > 280:
+        post, part_two = split_post(post)
     # If the function does not return a post, splitting failed and we will skip this post.
     if not post:
         return "skipped"
@@ -294,30 +289,30 @@ def tweet(post, replyTo, images, postType, doPost):
     # If post is both reply and has images it is posted as both a reply and with images (duh), if it's
     # a quote with images it's posted as that. If just either of the three it is posted as just that, 
     # and if neither it is just posted as a text post.
-    if replyTo and mediaIds and postType == "quote":
-        a = twitter.create_tweet(text=post, quote_tweet_id=replyTo, media_ids=mediaIds)
-    elif replyTo and mediaIds and postType == "reply":
-        a = twitter.create_tweet(text=post, in_reply_to_tweet_id=replyTo, media_ids=mediaIds)
-    elif postType == "quote":
-        a = twitter.create_tweet(text=post, quote_tweet_id=replyTo)
-    elif replyTo:
-        a = twitter.create_tweet(text=post, in_reply_to_tweet_id=replyTo)
-    elif mediaIds:
-        a = twitter.create_tweet(text=post, media_ids=mediaIds)
+    if reply_to and media_ids and post_type == "quote":
+        a = twitter.create_tweet(text=post, quote_tweet_id=reply_to, media_ids=media_ids)
+    elif reply_to and media_ids and post_type == "reply":
+        a = twitter.create_tweet(text=post, in_reply_to_tweet_id=reply_to, media_ids=media_ids)
+    elif post_type == "quote":
+        a = twitter.create_tweet(text=post, quote_tweet_id=reply_to)
+    elif reply_to:
+        a = twitter.create_tweet(text=post, in_reply_to_tweet_id=reply_to)
+    elif media_ids:
+        a = twitter.create_tweet(text=post, media_ids=media_ids)
     else:
         a = twitter.create_tweet(text=post)
-    writeLog("Posted to twitter")
+    write_log("Posted to twitter")
     id = a[0]["id"]
-    if partTwo:
-        a = twitter.create_tweet(text=partTwo, in_reply_to_tweet_id=id)
+    if part_two:
+        a = twitter.create_tweet(text=part_two, in_reply_to_tweet_id=id)
         id = a[0]["id"]
     return id
 
 # More or less the exact same function as for tweeting, but for tooting.
-def toot(post, replyTo, images, doPost):
-    if not settings.Mastodon or not doPost:
-        return "skipped";
-    mediaIds = []
+def toot(post, reply_to, images, do_post):
+    if not settings.Mastodon or not do_post:
+        return "skipped"
+    media_ids = []
     # If post includes images, images are uploaded so that they can be included in the toot
     if images:
         for image in images:
@@ -326,51 +321,51 @@ def toot(post, replyTo, images, doPost):
             # If alt text was added to the image on bluesky, it's also added to the image on mastodon,
             # otherwise it will be uploaded without alt text.
             if alt:
-                writeLog("Uploading image " + filename + " with alt: " + alt + " to mastodon")
+                write_log("Uploading image " + filename + " with alt: " + alt + " to mastodon")
                 res = mastodon.media_post(filename, description=alt)
             else:
-                writeLog("Uploading image " + filename)
+                write_log("Uploading image " + filename)
                 res = mastodon.media_post(filename)
-            mediaIds.append(res.id)
+            media_ids.append(res.id)
     # Visibility is set to whatever is set in the settings file. If that is hybrid, it sets the visibility either to public or unlisted depending on
     # if it is a reply in a thread or not.
     visibility = settings.mastodonVisibility
-    if visibility == "hybrid" and replyTo:
+    if visibility == "hybrid" and reply_to:
         visibility = "unlisted"
     elif visibility == "hybrid":
         visibility = "public"
     # I wanted to make this part a little neater, but didn't get it to work and gave up. So here we are.
     # If post is both reply and has images it is posted as both a reply and with images (duh). 
     # If just either of the two it is posted with just that, and if neither it is just posted as a text post.
-    if replyTo and mediaIds:
-        a = mastodon.status_post(post, in_reply_to_id=replyTo, media_ids=mediaIds, visibility=visibility)
-    elif replyTo:
-        a = mastodon.status_post(post, in_reply_to_id=replyTo, visibility=visibility)
-    elif mediaIds:
-        a = mastodon.status_post(post, media_ids=mediaIds, visibility=visibility)
+    if reply_to and media_ids:
+        a = mastodon.status_post(post, in_reply_to_id=reply_to, media_ids=media_ids, visibility=visibility)
+    elif reply_to:
+        a = mastodon.status_post(post, in_reply_to_id=reply_to, visibility=visibility)
+    elif media_ids:
+        a = mastodon.status_post(post, media_ids=media_ids, visibility=visibility)
     else:
         a = mastodon.status_post(post, visibility=visibility)
-    writeLog("Posted to mastodon")
+    write_log("Posted to mastodon")
     id = a["id"]
     return id
 
 # Function for correctly counting post length
-def postLength(post):
+def post_length(post):
     # Twitter shortens urls to 23 characters
-    shortUrlLength = 23
+    short_url_length = 23
     length = len(post)
     # Finding all urls and calculating how much shorter the post will be after shortening
     regex = r"(?i)\b((?:https?://|www\d{0,3}[.]|[a-z0-9.\-]+[.][a-z]{2,4}/)(?:[^\s()<>]+|\(([^\s()<>]+|(\([^\s()<>]+\)))*\))+(?:\(([^\s()<>]+|(\([^\s()<>]+\)))*\)|[^\s`!()\[\]{};:'\".,<>?«»“”‘’]))"
     urls = re.findall(regex, post)
     for url in urls:
-        urlLength = len(url[0])
-        if urlLength > shortUrlLength:
-            length = length - (urlLength - shortUrlLength)
+        url_length = len(url[0])
+        if url_length > short_url_length:
+            length = length - (url_length - short_url_length)
     return length
 
 # Function for splitting up posts that are too long for twitter.
-def splitPost(text):
-    writeLog("Splitting post that is too long for twitter.")
+def split_post(text):
+    write_log("Splitting post that is too long for twitter.")
     first = text
     # We first try to split the post into sentences, and send as many as can fit in the first one,
     # and the rest in the second.
@@ -392,13 +387,13 @@ def splitPost(text):
     # If splitting has ended up with either a first or second part that is too long, we return empty
     # strings and the post is not sent to twitter.
     if len(first) > 280 or len(second) > 280:
-        writeLog("Was not able to split post.")
+        write_log("Was not able to split post.")
         first = ""
         second = ""
     return first, second
 
 # Function for writing new lines to the database
-def jsonWrite(skeet, tweet, toot, failed):
+def json_write(skeet, tweet, toot, failed):
     ids = { 
         "twitterId": tweet,
         "mastodonId": toot
@@ -416,47 +411,40 @@ def jsonWrite(skeet, tweet, toot, failed):
         "ids": ids,
         "failed": failed
         }
-    jsonString = json.dumps(row)
-    # If the database file exists we want to append to it, otherwise we create it anew.
-    if os.path.exists(databasePath):
-        append_write = 'a'
-    else:
-        append_write = 'w'
-    # Skipping adding posts to db file if they are already in it.
-    if not isInDB(jsonString):
-        writeLog("Adding to database: " + jsonString)
-        file = open(databasePath, append_write)
-        file.write(jsonString + "\n")
-        file.close()
+    json_string = json.dumps(row)
+    if not is_in_db(json_string):
+        write_log("Adding to database: " + json_string)
+        with open(paths.databasePath, 'a') as file:
+            file.write(json_string + "\n")
 
 # Function for reading database file and saving values in a dictionary
-def jsonRead():
+def json_read():
     database = {}
-    if not os.path.exists(databasePath):
+    if not os.path.exists(paths.databasePath):
         return database
-    with open(databasePath, 'r') as file:
+    with open(paths.databasePath, 'r') as file:
         for line in file:
             try:
-                jsonLine = json.loads(line)
-            except:
+                json_line = json.loads(line)
+            except Exception:
                 continue
-            skeet = jsonLine["skeet"]
-            ids = jsonLine["ids"]
+            skeet = json_line["skeet"]
+            ids = json_line["ids"]
             failed = {"twitter": 0, "mastodon": 0}
-            if "failed" in jsonLine:
-                failed = jsonLine["failed"]
-            lineData = {
+            if "failed" in json_line:
+                failed = json_line["failed"]
+            line_data = {
                 "ids": ids,
                 "failed": failed
             }
-            database[skeet] = lineData
-    return database;
+            database[skeet] = line_data
+    return database
 
 # Function for checking if a line is already in the database-file
-def isInDB(line):
-     if not os.path.exists(databasePath):
-         return False
-     with open(databasePath, 'r') as file:
+def is_in_db(line):
+    if not os.path.exists(paths.databasePath):
+        return False
+    with open(paths.databasePath, 'r') as file:
         content = file.read()
         if line in content:
             return True
@@ -464,41 +452,40 @@ def isInDB(line):
             return False
 
 # Function for writing to the log file
-def writeLog(message):
+def write_log(message):
     now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     date = datetime.now().strftime("%y%m%d")
     message = str(now) + ": " + str(message) + "\n"
     print(message)
     if not settings.Logging:
-        return;
-    log = logPath + date + ".log"
+        return
+    log = os.path.join(paths.logPath, date + ".log")
     if os.path.exists(log):
         append_write = 'a'
     else:
         append_write = 'w'
-    dst = open(log, append_write)
-    dst.write(message)
-    dst.close()
+    with open(log, append_write) as dst:
+        dst.write(message)
 
 # Cleaning up downloaded images
 def cleanup():
-    writeLog("Deleting local images")
-    for filename in os.listdir(imagePath):
-        file_path = os.path.join(imagePath, filename)
+    write_log("Deleting local images")
+    for filename in os.listdir(paths.imagePath):
+        file_path = os.path.join(paths.imagePath, filename)
         try:
             if os.path.isfile(file_path) or os.path.islink(file_path):
                 os.unlink(file_path)
             elif os.path.isdir(file_path):
                 shutil.rmtree(file_path)
         except Exception as e:
-            writeLog('Failed to delete %s. Reason: %s' % (file_path, e))
+            write_log('Failed to delete %s. Reason: %s' % (file_path, e))
 
 # Since we are working with a version of the database in memory, at the end of the run
 # we completely overwrite the database on file with the one in memory.
 # This does kind of make it uneccessary to write each new post to the file while running,
 # but in case the program fails halfway through it gives us kind of a backup.
-def saveDB():
-    writeLog("Saving new database")
+def save_db():
+    write_log("Saving new database")
     append_write = "w"
     for skeet in database:
         row = {
@@ -506,14 +493,12 @@ def saveDB():
             "ids": database[skeet]["ids"],
             "failed": database[skeet]["failed"]
         }
-        jsonString = json.dumps(row)
-        file = open(databasePath, append_write)
-        file.write(jsonString + "\n")
-        file.close()
-        append_write = "a"
+        json_string = json.dumps(row)
+        with open(paths.databasePath, append_write) as file:
+            file.write(json_string + "\n")
 
 # Function for counting lines in a file
-def countLines(file):
+def count_lines(file):
     with open(file, 'r') as file:
         for count, line in enumerate(file):
             pass
@@ -523,27 +508,27 @@ def countLines(file):
 # If the live database contains fewer lines than the backup it means something has probably gone wrong,
 # and before the live database is saved as a backup, the current backup is saved as a new file, so that
 # it can be recovered later.
-def dbBackup():
-    if not os.path.isfile(databasePath) or (os.path.isfile(backupPath)
-        and datetime.fromtimestamp(os.stat(backupPath).st_mtime) > datetime.now() - timedelta(hours = 24)):
+def db_backup():
+    if not os.path.isfile(paths.databasePath) or (os.path.isfile(paths.backupPath)
+        and datetime.fromtimestamp(os.stat(paths.backupPath).st_mtime) > datetime.now() - timedelta(hours = 24)):
         return
-    if os.path.isfile(backupPath):
-        if countLines(backupPath) < countLines(databasePath):
-            os.remove(backupPath)
+    if os.path.isfile(paths.backupPath):
+        if count_lines(paths.backupPath) < count_lines(paths.databasePath):
+            os.remove(paths.backupPath)
         else:
             date = datetime.now().strftime("%y%m%d")
-            os.rename(backupPath, backupPath + "_" + date)
-            writeLog("Current backup file contains more entries than current live database, backup saved")
-    shutil.copyfile(databasePath, backupPath)
-    writeLog("Backup of database taken")
-            
+            os.rename(paths.backupPath, paths.backupPath + "_" + date)
+            write_log("Current backup file contains more entries than current live database, backup saved")
+    shutil.copyfile(paths.databasePath, paths.backupPath)
+    write_log("Backup of database taken")
+
 # Here the whole thing is run
-database = jsonRead()
-posts = getPosts()
+database = json_read()
+posts = get_posts()
 updates = post(posts)
 if updates:
-    saveDB()
+    save_db()
     cleanup()
-dbBackup()
+db_backup()
 if not posts:
-	writeLog("No new posts found.")
+    write_log("No new posts found.")

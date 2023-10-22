@@ -3,3 +3,5 @@ database.json
 database.bak
 .env
 dbhost/
+logs/
+auth.py
