@@ -214,6 +214,8 @@ def post(posts):
             write_log("Post was a reply to a post that is not in the database.")
             continue
         # If either tweet or toot has not previously been posted, we download images (given the post includes images).
+        if images and (not tweet_id or not toot_id):
+            images = get_images(images)
         # Trying to post to twitter and mastodon. If posting fails the post ID for each service is set to an
         # empty string, letting the code know it should try again next time the code is run.
         if not tweet_id and tweet_reply != "skipped" and tweet_reply != "FailedToPost":
